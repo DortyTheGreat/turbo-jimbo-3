@@ -1,6 +1,6 @@
 name = "Turbo JIMBO 3"
 author = "Crestwave & stod & Dorty"
-version = "0.6"
+version = "0.7"
 
 dst_compatible = true
 dont_starve_compatible = true
