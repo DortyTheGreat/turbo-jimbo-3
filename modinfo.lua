@@ -1,5 +1,5 @@
-name = "Turbo JIMBO 2"
-author = "Crestwave & stod"
+name = "Turbo JIMBO 3"
+author = "Crestwave & stod & Dorty"
 version = "0.6"
 
 dst_compatible = true
