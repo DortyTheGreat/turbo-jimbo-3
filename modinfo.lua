@@ -1,6 +1,6 @@
 name = "Turbo JIMBO 2"
 author = "Crestwave & stod"
-version = "0.4"
+version = "0.6"
 
 dst_compatible = true
 dont_starve_compatible = true
@@ -16,4 +16,4 @@ icon_atlas = "modicon.xml"
 icon = "modicon.tex"
 
 
-description = "Are you bad at poker? Now you can be bad even faster!\n\nAdds various QoL features for the JIMBO minigame."
+description = "Are you bad at poker? Now you can be bad even faster!\n\nAdds various QoL features for the JIMBO minigame, and a Smart AI that plays (or hints) the mathematically best joker and discards using the real server scoring rules. All settings are in the in-game CONFIGS panel, reward chances in the ODDS panel."
