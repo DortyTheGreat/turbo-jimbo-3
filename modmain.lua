@@ -6,7 +6,7 @@ local Widget = require("widgets/widget")
 local Templates = require("widgets/redux/templates")
 local PersistentData = require("persistentdata")
 local Brain = require("turbojimbo_brain")
-local AvgStats = require("turbojimbo_stats")
+local Profiles = require("turbojimbo_profiles")
 modimport("scripts/strings.lua")
 
 local STRINGS = GLOBAL.STRINGS
@@ -15,20 +15,14 @@ local STRINGS = GLOBAL.STRINGS
 -- Smart AI settings (edited in the in-game CONFIGS panel, saved with the mod data)
 --------------------------------------------------------------------------------
 
-local GOAL_OPTIONS = {
-	{ text = "Balanced", data = "balanced" },
-	{ text = "Jackpot", data = "jackpot" },
-	{ text = "Safe", data = "safe" },
-}
 local BUDGET_OPTIONS = {
 	{ text = "Fast", data = 0.5 },
 	{ text = "Normal", data = 1 },
 	{ text = "Deep", data = 2 },
 	{ text = "Very deep", data = 4 },
 }
--- Auto reroll: reroll before picking a joker if the best joker's expected loot value is below this.
-local REROLL_OPTIONS = AvgStats.REROLL_OPTIONS
 local MAX_REROLLS_IN_A_ROW = 40
+local MAX_CUSTOM_PROFILES = 12
 
 local function OptionText(options, data)
 	for _, o in ipairs(options) do
@@ -58,8 +52,60 @@ end
 
 local configs -- loaded below
 
+--------------------------------------------------------------------------------
+-- Profiles: presets (read-only) + the player's own (saved in configs.profiles)
+--------------------------------------------------------------------------------
+
+local function AllProfiles()
+	local t = {}
+	for _, p in ipairs(Profiles.PRESETS) do t[#t + 1] = p end
+	for _, p in ipairs(configs.profiles) do t[#t + 1] = p end
+	return t
+end
+
+local function FindProfile(id)
+	for _, p in ipairs(AllProfiles()) do
+		if p.id == id then return p end
+	end
+	return nil
+end
+
+local function ActiveProfile()
+	return FindProfile(configs.ai.profile) or Profiles.PRESETS[1]
+end
+
+local function ProfileOptions()
+	local options = {}
+	for _, p in ipairs(AllProfiles()) do
+		options[#options + 1] = { text = p.name, data = p.id }
+	end
+	return options
+end
+
 local function Utility()
-	return Brain.PROFILES[configs.ai.goal] or Brain.PROFILES.balanced
+	return ActiveProfile().util
+end
+
+-- "Reroll the worst X% of start configurations" (global setting). "auto" = best EV/min.
+local function RerollShare()
+	local v = configs.ai.reroll_share
+	if v == "auto" then return "auto" end
+	return v / 100
+end
+
+local function RerollShareOptions()
+	local options = {}
+	for _, v in ipairs(Profiles.REROLL_SHARES) do
+		local text = v == "auto" and STRINGS.BALATRO.TJ.SHARE_AUTO
+			or (v == 0 and STRINGS.BALATRO.TJ.SHARE_NEVER or string.format(STRINGS.BALATRO.TJ.SHARE_WORST, v))
+		options[#options + 1] = { text = text, data = v }
+	end
+	return options
+end
+
+-- Long-run summary of a profile; rerolls_on = whether starts are actually rerolled.
+local function ProfileSummary(profile, rerolls_on)
+	return Profiles.Summary(profile, rerolls_on and RerollShare() or 0)
 end
 
 local function BrainOpts()
@@ -125,9 +171,31 @@ end
 if type(configs.ai) ~= "table" then
 	configs.ai = {}
 end
-if not IsOption(GOAL_OPTIONS, configs.ai.goal) then configs.ai.goal = "balanced" end
+-- v0.6 had a fixed "goal" and a global reroll threshold: the goal becomes the profile.
+if configs.ai.profile == nil and type(configs.ai.goal) == "string" then
+	configs.ai.profile = configs.ai.goal
+end
+configs.ai.goal = nil
+configs.ai.reroll = nil
+local share_ok = false
+for _, v in ipairs(Profiles.REROLL_SHARES) do
+	if v == configs.ai.reroll_share then share_ok = true end
+end
+if not share_ok then
+	configs.ai.reroll_share = "auto"
+end
 if not IsOption(BUDGET_OPTIONS, configs.ai.budget) then configs.ai.budget = 1 end
-if not IsOption(REROLL_OPTIONS, configs.ai.reroll) then configs.ai.reroll = AvgStats.DEFAULT_REROLL end
+local saved_profiles = type(configs.profiles) == "table" and configs.profiles or {}
+configs.profiles = {}
+for _, saved in ipairs(saved_profiles) do
+	local profile = Profiles.Sanitize(saved)
+	if profile ~= nil and FindProfile(profile.id) == nil then
+		table.insert(configs.profiles, profile)
+	end
+end
+if FindProfile(configs.ai.profile) == nil then
+	configs.ai.profile = "balanced"
+end
 -- Your own results (reward rank counts + rerolls)
 if type(configs.stats) ~= "table" or type(configs.stats.ranks) ~= "table" then
 	configs.stats = { ranks = { 0, 0, 0, 0, 0, 0, 0, 0 }, rerolls = 0 }
@@ -142,6 +210,38 @@ ModData:Save()
 local function SaveConfigs()
 	ModData:SetValue("configs", configs)
 	ModData:Save()
+end
+
+-- New profile = editable copy of the active one.
+local function NewProfile()
+	if #configs.profiles >= MAX_CUSTOM_PROFILES then
+		return nil
+	end
+	local n = 1
+	while FindProfile("custom" .. n) ~= nil do
+		n = n + 1
+	end
+	local profile = Profiles.Copy(ActiveProfile(), "custom" .. n, string.format(STRINGS.BALATRO.TJ.CUSTOM_NAME, n))
+	table.insert(configs.profiles, profile)
+	configs.ai.profile = profile.id
+	SaveConfigs()
+	return profile
+end
+
+local function DeleteActiveProfile()
+	local active = ActiveProfile()
+	if active.preset then
+		return false
+	end
+	for i, p in ipairs(configs.profiles) do
+		if p.id == active.id then
+			table.remove(configs.profiles, i)
+			break
+		end
+	end
+	configs.ai.profile = "balanced"
+	SaveConfigs()
+	return true
 end
 
 -- Auto reroll streak, shared between game screens.
@@ -498,12 +598,13 @@ local function RerollActive()
 	return cb.smart and cb.autoplay and cb.replay and cb.auto_reroll
 end
 
-local function Loot(dist)
-	return dist ~= nil and Brain.ExpectedValue(dist, Brain.PROFILES.balanced) or nil
+-- Expected value of a reward distribution under the active profile.
+local function EVof(dist)
+	return dist ~= nil and Profiles.EV(dist, Utility()) or nil
 end
 
 local function DistLine(dist)
-	return string.format(STRINGS.BALATRO.TJ.ODDS, Pct(dist[1]), Pct(dist[6] + dist[7] + dist[8]), Pct(dist[8]), Loot(dist))
+	return string.format(STRINGS.BALATRO.TJ.ODDS, Pct(dist[1]), Pct(dist[6] + dist[7] + dist[8]), Pct(dist[8]), EVof(dist))
 end
 
 --------------------------------------------------------------------------------
@@ -732,11 +833,13 @@ AddClassPostConstruct("widgets/redux/balatrowidget", function(self)
 			if self.mode == "joker" then
 				local names = self:TJ_JokerNames()
 				local advice = self.tj.joker_advice
+				local profile = ActiveProfile()
 				for i = 1, 3 do
 					if names[i] ~= nil then
 						local best = advice ~= nil and advice.best == i
+						local mark = best and "*" or ""
 						table.insert(cols, {
-							header = (best and "*" or "") .. ShortName(names[i]),
+							header = mark .. ShortName(names[i]),
 							dist = advice ~= nil and advice.dists[i] or nil,
 							highlight = best,
 						})
@@ -755,8 +858,8 @@ AddClassPostConstruct("widgets/redux/balatrowidget", function(self)
 				end
 			end
 		end
-		local reroll = RerollActive() and configs.ai.reroll or nil
-		table.insert(cols, { header = STRINGS.BALATRO.TJ.COL_AVG, dist = AvgStats.Get(configs.ai.goal, reroll), empty = true })
+		local summary = ProfileSummary(ActiveProfile(), RerollActive())
+		table.insert(cols, { header = STRINGS.BALATRO.TJ.COL_AVG, dist = summary.play > 0 and summary.dist or nil, empty = true })
 		local played = 0
 		for r = 1, 8 do
 			played = played + configs.stats.ranks[r]
@@ -795,18 +898,18 @@ AddClassPostConstruct("widgets/redux/balatrowidget", function(self)
 					elseif row <= 8 then
 						cell:SetString(col.dist ~= nil and Pct(col.dist[row]) or missing)
 					else
-						cell:SetString(col.dist ~= nil and string.format("%.1f", Loot(col.dist)) or missing)
+						cell:SetString(col.dist ~= nil and string.format("%.1f", EVof(col.dist)) or missing)
 					end
 				end
 			end
 		end
-		local reroll = RerollActive() and configs.ai.reroll or nil
+		local summary = ProfileSummary(ActiveProfile(), RerollActive())
 		panel.subtitle:SetString(string.format(STRINGS.BALATRO.TJ.ODDS_SUBTITLE,
-			OptionText(GOAL_OPTIONS, configs.ai.goal),
+			ActiveProfile().name,
 			OptionText(BUDGET_OPTIONS, configs.ai.budget),
-			reroll ~= nil and OptionText(REROLL_OPTIONS, reroll) or STRINGS.BALATRO.TJ.OFF))
+			RerollActive() and STRINGS.BALATRO.TJ.ON or STRINGS.BALATRO.TJ.OFF))
 		panel.footer:SetString(string.format(STRINGS.BALATRO.TJ.ODDS_FOOTER,
-			AvgStats.Rerolls(configs.ai.goal, reroll), played, configs.stats.rerolls))
+			Pct(summary.play), summary.play > 0 and summary.rerolls or 0, played, configs.stats.rerolls))
 	end
 
 	----------------------------------------------------------------------------
@@ -863,17 +966,22 @@ AddClassPostConstruct("widgets/redux/balatrowidget", function(self)
 		end
 		self.tj.joker_advice = { best = best, values = values, dists = dists }
 
+		local profile = ActiveProfile()
 		local others = {}
 		for i = 1, 3 do
 			if i ~= best and names[i] ~= nil then
-				local v = Loot(dists[i])
+				local v = EVof(dists[i])
 				table.insert(others, JokerDisplayName(names[i]) .. " " .. (v ~= nil and string.format("%.1f", v) or "?"))
 			end
 		end
-		local best_loot = Loot(dists[best]) or 0
-		local weak = best_loot < configs.ai.reroll
-		self:TJ_SetText(string.format(STRINGS.BALATRO.TJ.JOKER_HINT, JokerDisplayName(names[best]), best_loot, table.concat(others, ", "))
-			.. (weak and ("\n" .. STRINGS.BALATRO.TJ.WEAK_START) or ""))
+		-- A start = hand + offered jokers; its EV is the best joker's EV.
+		local best_ev = EVof(dists[best]) or values[best]
+		local rule = ProfileSummary(profile, true)
+		local weak = rule.threshold ~= nil and best_ev < rule.threshold
+		local beats = Profiles.Percentile(profile, best_ev)
+		self:TJ_SetText(string.format(STRINGS.BALATRO.TJ.JOKER_HINT, JokerDisplayName(names[best]), best_ev, Pct(beats)) .. "\n"
+			.. (weak and string.format(STRINGS.BALATRO.TJ.WEAK_START, Pct(rule.share))
+				or string.format(STRINGS.BALATRO.TJ.OTHERS, table.concat(others, ", "))))
 		self:TJ_RefreshOdds()
 
 		if checkboxes.autoplay then
@@ -1007,6 +1115,7 @@ AddClassPostConstruct("widgets/redux/balatrowidget", function(self)
 			self.root.game_configs.showing = false
 		end
 		self:TJ_ShowOdds(false)
+		self:TJ_ShowProfile(false)
 	end)
 
 	-- Create the configs button
@@ -1031,6 +1140,7 @@ AddClassPostConstruct("widgets/redux/balatrowidget", function(self)
 			self.root.game_notes.showing = false
 		end
 		self:TJ_ShowOdds(false)
+		self:TJ_ShowProfile(false)
 	end)
 
 	-- Create the configs screen
@@ -1082,6 +1192,12 @@ AddClassPostConstruct("widgets/redux/balatrowidget", function(self)
 
 	-- Called when an AI setting changes: drop the running analysis and redo it.
 	function self:TJ_OnSettingsChanged()
+		if self.TJ_SyncSettingWidgets ~= nil then
+			self:TJ_SyncSettingWidgets()
+		end
+		if self.TJ_RefreshProfile ~= nil and not self.tj.refreshing then
+			self:TJ_RefreshProfile()
+		end
 		self:TJ_CancelJob()
 		self:TJ_SetText("")
 		self.tj.joker_advice = nil
@@ -1105,9 +1221,9 @@ AddClassPostConstruct("widgets/redux/balatrowidget", function(self)
 	local ai_section = self.root.game_configs:AddChild(Widget("tj_ai_section"))
 	self.root.game_configs.ai_section = ai_section
 	ai_section.title = ai_section:AddChild(Text(GLOBAL.CHATFONT_OUTLINE, 24, STRINGS.BALATRO.TJ.SETTINGS_TITLE, GLOBAL.UICOLOURS.GOLD))
-	ai_section.title:SetPosition(0, 28, 0)
+	ai_section.title:SetPosition(0, 32, 0)
 	local function AddSpinner(label, options, key, y)
-		local w = ai_section:AddChild(Templates.LabelSpinner(label, options, 180, 220, 34, 8, GLOBAL.CHATFONT_OUTLINE, 22))
+		local w = ai_section:AddChild(Templates.LabelSpinner(label, options, 180, 220, 30, 8, GLOBAL.CHATFONT_OUTLINE, 21))
 		w:SetPosition(0, y, 0)
 		w.spinner:SetSelected(configs.ai[key])
 		w.spinner:SetOnChangedFn(function(data)
@@ -1117,11 +1233,42 @@ AddClassPostConstruct("widgets/redux/balatrowidget", function(self)
 		end)
 		return w
 	end
-	ai_section.goal = AddSpinner(STRINGS.BALATRO.TJ.SETTING_GOAL, GOAL_OPTIONS, "goal", -6)
-	ai_section.budget = AddSpinner(STRINGS.BALATRO.TJ.SETTING_BUDGET, BUDGET_OPTIONS, "budget", -42)
-	ai_section.reroll = AddSpinner(STRINGS.BALATRO.TJ.SETTING_REROLL, REROLL_OPTIONS, "reroll", -78)
-	ai_section.note = ai_section:AddChild(Text(GLOBAL.CHATFONT_OUTLINE, 17, STRINGS.BALATRO.TJ.SETTINGS_NOTE, GLOBAL.UICOLOURS.GOLD))
-	ai_section.note:SetPosition(0, -112, 0)
+	ai_section.profile = AddSpinner(STRINGS.BALATRO.TJ.SETTING_PROFILE, ProfileOptions(), "profile", 2)
+	ai_section.budget = AddSpinner(STRINGS.BALATRO.TJ.SETTING_BUDGET, BUDGET_OPTIONS, "budget", -30)
+	ai_section.reroll = AddSpinner(STRINGS.BALATRO.TJ.SETTING_REROLL, RerollShareOptions(), "reroll_share", -62)
+	ai_section.edit = ai_section:AddChild(ImageButton("images/balatro.xml", "button_normal.tex", "button_focus.tex", "button_disabled.tex", "button_normal.tex", "button_focus.tex", { 0.7, 0.7, 0.7 }))
+	ai_section.edit:SetPosition(0, -94, 0)
+	ai_section.edit:SetScale(0.55)
+	ai_section.edit:SetTextSize(25)
+	ai_section.edit:SetNormalScale(0.7, 0.7, 0.7)
+	ai_section.edit:SetFocusScale(0.75, 0.75, 0.75)
+	ai_section.edit:SetText(STRINGS.BALATRO.TJ.BUTTON_PROFILES)
+	ai_section.edit:SetOnClick(function()
+		self:TJ_ShowProfile(true)
+	end)
+
+	-- Show `data` in a spinner without firing its change callback.
+	local function SilentSelect(spinner, data, options)
+		local fn = spinner.onchangedfn
+		spinner:SetOnChangedFn(nil)
+		if options ~= nil then
+			spinner:SetOptions(options)
+		end
+		spinner:SetSelected(data)
+		spinner:SetOnChangedFn(fn)
+	end
+
+	-- Keep every settings widget in sync (the reroll share is shown in two panels).
+	function self:TJ_SyncSettingWidgets()
+		SilentSelect(ai_section.profile.spinner, configs.ai.profile, ProfileOptions())
+		SilentSelect(ai_section.reroll.spinner, configs.ai.reroll_share)
+		if self.root.game_profile ~= nil then
+			SilentSelect(self.root.game_profile.summary.reroll.spinner, configs.ai.reroll_share)
+		end
+	end
+	self.TJ_RefreshProfileSpinner = self.TJ_SyncSettingWidgets
+	ai_section.note = ai_section:AddChild(Text(GLOBAL.CHATFONT_OUTLINE, 15, STRINGS.BALATRO.TJ.SETTINGS_NOTE, GLOBAL.UICOLOURS.GOLD))
+	ai_section.note:SetPosition(0, -121, 0)
 	ai_section.note:SetRegionSize(420, 40)
 	ai_section.note:EnableWordWrap(true)
 
@@ -1304,6 +1451,7 @@ AddClassPostConstruct("widgets/redux/balatrowidget", function(self)
 				self.root.game_configs:Hide()
 				self.root.game_configs.showing = false
 			end
+			self:TJ_ShowProfile(false)
 		end
 		self:TJ_ShowOdds(show)
 	end)
@@ -1344,6 +1492,264 @@ AddClassPostConstruct("widgets/redux/balatrowidget", function(self)
 	panel.footer:SetPosition(0, -112, 0)
 	panel.footer:SetRegionSize(460, 40)
 	panel.footer:EnableWordWrap(true)
+
+	----------------------------------------------------------------------------
+	-- PROFILE panel: reward values, joker matrix with blocks, % to play + final odds
+	----------------------------------------------------------------------------
+
+	local TJ = STRINGS.BALATRO.TJ
+	local DIM = { 0.55, 0.55, 0.55, 1 }
+	local UTIL_OPTIONS = {}
+	for _, v in ipairs(Profiles.UTILITY_VALUES) do
+		table.insert(UTIL_OPTIONS, { text = Profiles.FormatValue(v), data = v })
+	end
+	local PAGE_OPTIONS = {
+		{ text = TJ.PAGE_VALUES, data = 1 },
+		{ text = TJ.PAGE_JOKERS_1, data = 2 },
+		{ text = TJ.PAGE_JOKERS_2, data = 3 },
+		{ text = TJ.PAGE_SUMMARY, data = 4 },
+	}
+
+	local function SmallText(parent, size, x, y, w, align, colour)
+		local t = parent:AddChild(Text(GLOBAL.CHATFONT_OUTLINE, size, "", colour or GLOBAL.UICOLOURS.WHITE))
+		t:SetRegionSize(w, size + 4)
+		if align ~= nil then t:SetHAlign(align) end
+		t:SetPosition(x, y, 0)
+		return t
+	end
+
+	local function SmallButton(parent, label, x, y, onclick)
+		local b = parent:AddChild(ImageButton("images/balatro.xml", "button_normal.tex", "button_focus.tex", "button_disabled.tex", "button_normal.tex", "button_focus.tex", { 0.7, 0.7, 0.7 }))
+		b:SetPosition(x, y, 0)
+		b:SetScale(0.5)
+		b:SetTextSize(25)
+		b:SetNormalScale(0.7, 0.7, 0.7)
+		b:SetFocusScale(0.75, 0.75, 0.75)
+		b:SetText(label)
+		b:SetOnClick(onclick)
+		return b
+	end
+
+	local pp = self.root:AddChild(UIAnim())
+	self.root.game_profile = pp
+	pp:GetAnimState():SetBuild("ui_balatro")
+	pp:GetAnimState():SetBank("ui_balatro")
+	pp:GetAnimState():PlayAnimation("green_idle", true)
+	pp:SetPosition(150, -40, 0)
+	pp:Hide()
+	pp.showing = false
+	pp.page = 1
+	pp.title = pp:AddChild(Text(GLOBAL.CHATFONT_OUTLINE, 24, "", GLOBAL.UICOLOURS.GOLD))
+	pp.title:SetPosition(0, 170, 0)
+	pp.page_spinner = pp:AddChild(Templates.StandardSpinner(PAGE_OPTIONS, 300, 30, GLOBAL.CHATFONT_OUTLINE, 20, function(data)
+		pp.page = data
+		self:TJ_RefreshProfile()
+	end))
+	pp.page_spinner:SetPosition(0, 143, 0)
+
+	-- Apply an edit to the active (custom) profile.
+	function self:TJ_EditProfile(fn)
+		if self.tj.refreshing then
+			return
+		end
+		local profile = ActiveProfile()
+		if not profile.preset then
+			fn(profile)
+			SaveConfigs()
+			self:TJ_OnSettingsChanged()
+		end
+		self:TJ_RefreshProfile()
+	end
+
+	-- Page 1: utility value of every reward
+	pp.values = pp:AddChild(Widget("tj_values"))
+	pp.values.rows = {}
+	for r = 1, 8 do
+		local w = pp.values:AddChild(Templates.LabelSpinner(TJ.TIERS[r], UTIL_OPTIONS, 190, 170, 26, 8, GLOBAL.CHATFONT_OUTLINE, 19))
+		w:SetPosition(0, 114 - 25 * (r - 1), 0)
+		w.spinner:SetOnChangedFn(function(data)
+			self:TJ_EditProfile(function(profile)
+				profile.util[r] = data
+			end)
+		end)
+		pp.values.rows[r] = w
+	end
+	pp.values.hint = pp.values:AddChild(Text(GLOBAL.CHATFONT_OUTLINE, 16, TJ.VALUES_HINT, GLOBAL.UICOLOURS.GOLD))
+	pp.values.hint:SetPosition(0, -86, 0)
+	pp.values.hint:SetRegionSize(460, 36)
+	pp.values.hint:EnableWordWrap(true)
+
+	-- Pages 2-3: joker matrix (sorted by EV, read-only) + how often the AI plays each joker
+	local MX_NAME_X, MX_TIER_X0, MX_TIER_DX, MX_EV_X, MX_PICK_X = -205, -128, 35, 158, 212
+	pp.matrix = pp:AddChild(Widget("tj_matrix"))
+	local mh = SmallText(pp.matrix, 15, MX_NAME_X, 114, 76, GLOBAL.ANCHOR_LEFT, GLOBAL.UICOLOURS.GOLD)
+	mh:SetString(TJ.COL_JOKER)
+	for r = 1, 8 do
+		SmallText(pp.matrix, 15, MX_TIER_X0 + MX_TIER_DX * (r - 1), 114, 36, nil, GLOBAL.UICOLOURS.GOLD):SetString(TJ.TIERS_SHORT[r])
+	end
+	SmallText(pp.matrix, 15, MX_EV_X, 114, 44, nil, GLOBAL.UICOLOURS.GOLD):SetString(TJ.COL_EV)
+	SmallText(pp.matrix, 15, MX_PICK_X, 114, 46, nil, GLOBAL.UICOLOURS.GOLD):SetString(TJ.COL_PICK)
+	pp.matrix.rows = {}
+	for k = 1, 9 do
+		local y = 92 - 22 * (k - 1)
+		local row = {}
+		row.name = SmallText(pp.matrix, 16, MX_NAME_X, y, 76, GLOBAL.ANCHOR_LEFT)
+		row.cells = {}
+		for r = 1, 8 do
+			row.cells[r] = SmallText(pp.matrix, 16, MX_TIER_X0 + MX_TIER_DX * (r - 1), y, 36)
+		end
+		row.ev = SmallText(pp.matrix, 16, MX_EV_X, y, 44)
+		row.pick = SmallText(pp.matrix, 16, MX_PICK_X, y, 46, nil, GLOBAL.UICOLOURS.GOLD)
+		pp.matrix.rows[k] = row
+	end
+
+	-- Page 4: summary. The reroll share is the same global setting as in CONFIGS.
+	pp.summary = pp:AddChild(Widget("tj_summary"))
+	pp.summary.reroll = pp.summary:AddChild(Templates.LabelSpinner(TJ.SETTING_REROLL, RerollShareOptions(), 150, 230, 28, 8, GLOBAL.CHATFONT_OUTLINE, 19))
+	pp.summary.reroll:SetPosition(0, 116, 0)
+	pp.summary.reroll.spinner:SetSelected(configs.ai.reroll_share)
+	pp.summary.reroll.spinner:SetOnChangedFn(function(data)
+		if self.tj.refreshing then return end
+		configs.ai.reroll_share = data
+		SaveConfigs()
+		self:TJ_OnSettingsChanged()
+		self:TJ_RefreshProfile()
+	end)
+	local SUM_LABELS = { TJ.ROW_THRESHOLD, TJ.ROW_PLAY, TJ.ROW_REROLLS }
+	for r = 1, 8 do SUM_LABELS[#SUM_LABELS + 1] = TJ.TIERS[r] end
+	SUM_LABELS[#SUM_LABELS + 1] = TJ.ROW_EV_GAME
+	SUM_LABELS[#SUM_LABELS + 1] = TJ.ROW_EV_MIN
+	pp.summary.h1 = SmallText(pp.summary, 15, 55, 91, 110, nil, GLOBAL.UICOLOURS.GOLD)
+	pp.summary.h1:SetString(TJ.COL_NO_REROLLS)
+	pp.summary.h2 = SmallText(pp.summary, 15, 170, 91, 120, nil, GLOBAL.UICOLOURS.GOLD)
+	pp.summary.rows = {}
+	for i, label in ipairs(SUM_LABELS) do
+		local y = 91 - 15 * i
+		SmallText(pp.summary, 15, -140, y, 200, GLOBAL.ANCHOR_LEFT, GLOBAL.UICOLOURS.GOLD):SetString(label)
+		pp.summary.rows[i] = { base = SmallText(pp.summary, 15, 55, y, 110), mine = SmallText(pp.summary, 15, 170, y, 120) }
+	end
+
+	-- Bottom buttons
+	pp.new_btn = SmallButton(pp, TJ.BUTTON_NEW, -170, -124, function()
+		if NewProfile() ~= nil then
+			self:TJ_RefreshProfileSpinner()
+			self:TJ_OnSettingsChanged()
+			self:TJ_RefreshProfile()
+		end
+	end)
+	pp.del_btn = SmallButton(pp, TJ.BUTTON_DELETE, -95, -124, function()
+		if DeleteActiveProfile() then
+			self:TJ_RefreshProfileSpinner()
+			self:TJ_OnSettingsChanged()
+			self:TJ_RefreshProfile()
+		end
+	end)
+	pp.back_btn = SmallButton(pp, TJ.BUTTON_BACK, 205, -124, function()
+		self:TJ_ShowProfile(false)
+		self.root.game_configs:MoveToFront()
+		self.root.game_configs:Show()
+		self.root.game_configs.showing = true
+	end)
+	pp.status = pp:AddChild(Text(GLOBAL.CHATFONT_OUTLINE, 15, "", GLOBAL.UICOLOURS.GOLD))
+	pp.status:SetPosition(55, -124, 0)
+	pp.status:SetRegionSize(190, 36)
+	pp.status:EnableWordWrap(true)
+
+	function self:TJ_ShowProfile(show)
+		if show then
+			if self.root.game_notes.showing then
+				self.root.game_notes:Hide()
+				self.root.game_notes.showing = false
+			end
+			if self.root.game_configs.showing then
+				self.root.game_configs:Hide()
+				self.root.game_configs.showing = false
+			end
+			self:TJ_ShowOdds(false)
+			pp:MoveToFront()
+			pp:Show()
+			pp.showing = true
+			self:TJ_RefreshProfile()
+		else
+			pp:Hide()
+			pp.showing = false
+		end
+	end
+
+	function self:TJ_RefreshProfile()
+		if not pp.showing then
+			return
+		end
+		self.tj.refreshing = true
+		local profile = ActiveProfile()
+		local editable = not profile.preset
+		local rows, res = Profiles.Matrix(profile, RerollShare())
+
+		pp.title:SetString(string.format(editable and TJ.PROFILE_TITLE or TJ.PRESET_TITLE, profile.name))
+		if editable then pp.del_btn:Enable() else pp.del_btn:Disable() end
+		if #configs.profiles < MAX_CUSTOM_PROFILES then pp.new_btn:Enable() else pp.new_btn:Disable() end
+
+		local page = pp.page
+		if page == 1 then pp.values:Show() else pp.values:Hide() end
+		if page == 2 or page == 3 then pp.matrix:Show() else pp.matrix:Hide() end
+		if page == 4 then pp.summary:Show() else pp.summary:Hide() end
+
+		if page == 4 then
+			pp.status:SetString(string.format(TJ.TIME_NOTE, Profiles.SECONDS_PER_GAME, Profiles.SECONDS_PER_REROLL, Pct(res.auto_share)))
+		else
+			pp.status:SetString(editable and string.format(TJ.STATUS_EDITABLE, res.hands, res.style) or TJ.STATUS_PRESET)
+		end
+
+		if page == 1 then
+			for r = 1, 8 do
+				local spinner = pp.values.rows[r].spinner
+				spinner:SetSelected(profile.util[r])
+				if editable then spinner:Enable() else spinner:Disable() end
+			end
+		elseif page == 2 or page == 3 then
+			local first = page == 2 and 0 or 9
+			for k = 1, 9 do
+				local row, data = pp.matrix.rows[k], rows[first + k]
+				if data == nil then
+					row.name:SetString("")
+					for r = 1, 8 do row.cells[r]:SetString("") end
+					row.ev:SetString("")
+					row.pick:SetString("")
+				else
+					-- jokers the AI (almost) never plays are dimmed
+					local colour = data.pick < 0.005 and DIM or GLOBAL.UICOLOURS.WHITE
+					row.name:SetString(ShortName(data.joker))
+					row.name:SetColour(colour)
+					for r = 1, 8 do
+						row.cells[r]:SetString(Pct(data.dist[r]))
+						row.cells[r]:SetColour(colour)
+					end
+					row.ev:SetString(string.format("%.2f", data.ev))
+					row.ev:SetColour(colour)
+					row.pick:SetString(Pct(data.pick))
+				end
+			end
+		elseif page == 4 then
+			pp.summary.reroll.spinner:SetSelected(configs.ai.reroll_share)
+			pp.summary.h2:SetString(res.share > 0 and string.format(TJ.COL_REROLL_WORST, Pct(res.share)) or TJ.COL_NO_REROLLS)
+			local r = pp.summary.rows
+			r[1].base:SetString("-")
+			r[1].mine:SetString(res.threshold ~= nil and string.format("%.2f", res.threshold) or "-")
+			r[2].base:SetString("100%")
+			r[2].mine:SetString(Pct(res.play))
+			r[3].base:SetString("0.00")
+			r[3].mine:SetString(string.format("%.2f", res.rerolls))
+			for t = 1, 8 do
+				r[3 + t].base:SetString(Pct(res.base_dist[t]))
+				r[3 + t].mine:SetString(Pct(res.dist[t]))
+			end
+			r[12].base:SetString(string.format("%.2f", res.base_ev))
+			r[12].mine:SetString(string.format("%.2f", res.ev))
+			r[13].base:SetString(string.format("%.2f", res.base_rate))
+			r[13].mine:SetString(string.format("%.2f", res.rate))
+		end
+		self.tj.refreshing = false
+	end
 
 	function self:EnableMacros(set)
 		self.root.macro1:Update(set)

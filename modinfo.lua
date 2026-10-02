@@ -1,6 +1,6 @@
 name = "Turbo JIMBO 3"
 author = "Crestwave & stod & Dorty"
-version = "0.7"
+version = "0.8"
 
 dst_compatible = true
 dont_starve_compatible = true
@@ -16,4 +16,4 @@ icon_atlas = "modicon.xml"
 icon = "modicon.tex"
 
 
-description = "Are you bad at poker? Now you can be bad even faster!\n\nAdds various QoL features for the JIMBO minigame, and a Smart AI that plays (or hints) the mathematically best joker and discards using the real server scoring rules. All settings are in the in-game CONFIGS panel, reward chances in the ODDS panel."
+description = "Are you bad at poker? Now you can be bad even faster!\n\nAdds various QoL features for the JIMBO minigame, and a Smart AI that plays (or hints) the mathematically best joker and discards using the real server scoring rules. Create your own profiles (what each reward is worth to you), see every joker's odds, and reroll the worst X% of starts (or Auto: best value per minute). Settings in CONFIGS, live chances in ODDS."
